@@ -1,0 +1,160 @@
+name: Release
+
+# On a push to main, builds and publishes the release for the version in
+# VERSION, unless a release with its tag already exists. See README.md.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  ALPINE_IMAGE: alpine:3.24
+
+jobs:
+  plan:
+    runs-on: ubuntu-26.04
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      upstream: ${{ steps.plan.outputs.upstream }}
+      tag: ${{ steps.plan.outputs.tag }}
+      release: ${{ steps.plan.outputs.release }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          version=$(cat VERSION)
+          if ! grep -Eqx '[0-9]+\.[0-9]+(\.[0-9]+)?(-[0-9]+)?' <<< "$version"; then
+            echo "::error file=VERSION::VERSION must look like 2.42.4 or 2.42.4-2, got: $version"
+            exit 1
+          fi
+          tag=v$version
+          if gh release view "$tag" --json tagName > /dev/null 2> "$RUNNER_TEMP/gh-error"; then
+            release=false
+            echo "Release $tag exists, nothing to build."
+          elif grep -q 'release not found' "$RUNNER_TEMP/gh-error"; then
+            release=true
+            echo "Release $tag does not exist yet, building it."
+          else
+            cat "$RUNNER_TEMP/gh-error" >&2
+            exit 1
+          fi
+          {
+            echo "version=$version"
+            echo "upstream=${version%-*}"
+            echo "tag=$tag"
+            echo "release=$release"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.release == 'true'
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-26.04
+          - arch: aarch64
+            runner: ubuntu-26.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    env:
+      ARCH: ${{ matrix.arch }}
+      UPSTREAM: ${{ needs.plan.outputs.upstream }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build in ${{ env.ALPINE_IMAGE }}
+        run: |
+          docker pull --quiet "$ALPINE_IMAGE"
+          image=$(docker image inspect --format '{{index .RepoDigests 0}}' "$ALPINE_IMAGE")
+          docker run --rm -v "$PWD:/work" -w /work "$image" scripts/build.sh
+          echo "image: $image" >> "dist/build-$ARCH.txt"
+      - name: Check on ${{ matrix.runner }}
+        run: scripts/check.sh "dist/sfdisk-$UPSTREAM-$ARCH-linux-musl" "$UPSTREAM"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sfdisk-${{ matrix.arch }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    needs: [plan, build]
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+      UPSTREAM: ${{ needs.plan.outputs.upstream }}
+      TAG: ${{ needs.plan.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: sfdisk-*
+          path: dist
+          merge-multiple: true
+      - name: Fetch the util-linux source
+        run: |
+          tarball=util-linux-$UPSTREAM.tar.xz
+          series=$(cut -d. -f1-2 <<< "$UPSTREAM")
+          curl -fsSL -o "dist/$tarball" "https://mirrors.edge.kernel.org/pub/linux/utils/util-linux/v$series/$tarball"
+          cd dist
+          grep "  $tarball\$" ../util-linux.sha256 | sha256sum -c -
+      - name: Bundle the licenses
+        run: |
+          tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$(git log -1 --format=%ct)" -cf - licenses |
+            gzip -9n > "dist/licenses-$UPSTREAM.tar.gz"
+      - name: Write checksums and release notes
+        run: |
+          cd dist
+          sha256sum sfdisk-* "util-linux-$UPSTREAM.tar.xz" "licenses-$UPSTREAM.tar.gz" > SHA256SUMS
+          cat SHA256SUMS
+          checksum=$(awk -v f="util-linux-$UPSTREAM.tar.xz" '$2 == f { print $1 }' SHA256SUMS)
+          run_url=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+          cat > "$RUNNER_TEMP/notes.md" <<EOF
+          Statically linked \`sfdisk\` from util-linux $UPSTREAM, built with musl for x86_64 and aarch64 Linux.
+
+          ## Build
+
+          - Source: \`util-linux-$UPSTREAM.tar.xz\` from kernel.org, unmodified, SHA-256 \`$checksum\`.
+          - Built by [this workflow run]($run_url) from $GITHUB_SHA with \`scripts/build.sh\` in \`$ALPINE_IMAGE\`, natively on GitHub-hosted \`ubuntu-26.04\` (x86_64) and \`ubuntu-26.04-arm\` (aarch64) runners. The configure flags are in \`scripts/build.sh\` at this tag.
+          - Checked with \`scripts/check.sh\` on the same runners: statically linked, runs \`--version\` from an empty chroot, writes and reads back a GPT on a disk image.
+
+          \`\`\`
+          $(cat build-x86_64.txt)
+
+          $(cat build-aarch64.txt)
+          \`\`\`
+
+          ## Licensing
+
+          Each \`sfdisk\` binary is one work combining util-linux (GPL-2.0-or-later; libfdisk, libblkid and libsmartcols under LGPL-2.1-or-later; libuuid under BSD-3-Clause) and the musl C library (MIT), and is distributed under GPL-2.0-or-later. The complete corresponding source is \`util-linux-$UPSTREAM.tar.xz\`, attached to this release. The license texts and copyright notices are in \`licenses-$UPSTREAM.tar.gz\`. Read the Licensing section of README.md before redistributing.
+          EOF
+          cat "$RUNNER_TEMP/notes.md"
+      - name: Publish ${{ needs.plan.outputs.tag }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "$TAG" --target "$GITHUB_SHA" --title "sfdisk $VERSION" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            dist/sfdisk-* "dist/util-linux-$UPSTREAM.tar.xz" "dist/licenses-$UPSTREAM.tar.gz" dist/SHA256SUMS

@@ -15,9 +15,9 @@ Statically linked `sfdisk` binaries from [util-linux](https://github.com/util-li
 | `SHA256SUMS` | checksums of the binaries, the tarball and the licenses bundle |
 | Source code (zip, tar.gz) | this repository at the release tag |
 
-Release tags are `v<util-linux version>`, with a `-<n>` suffix for a rebuild of the same upstream version, for example `v2.42.4` or `v2.42.4-2`.
+Release tags are `v<util-linux version>`, with a `-<n>` suffix for a rebuild of the same upstream version, for example `v2.42.4` or `v2.42.4-2`. Asset names carry the util-linux version without the suffix.
 
-To verify a download, check it against `SHA256SUMS` from the same release, confirm with `file` that it is `statically linked`, and run it with `--version`. Software that installs the binary automatically should pin the SHA-256 of the exact asset in its own release and verify it before installing.
+To verify a download, check it against `SHA256SUMS` from the same release, confirm with `file` that it is `static-pie linked`, and run it with `--version`. Software that installs the binary automatically should pin the SHA-256 of the exact asset in its own release and verify it before installing.
 
 ## Licensing
 
@@ -41,15 +41,15 @@ The GPL governs the combination, so each binary is distributed under **GPL-2.0-o
 1. *Provide the complete corresponding source* (GPLv2 section 3a). The unmodified util-linux tarball is attached to the same release as the binaries, and the exact build configuration is documented below and in the release's repository snapshot. util-linux is not modified; if a patch is ever needed it will be committed here and listed in the release notes.
 2. *Keep the license texts and copyright notices with the binary* (GPLv2 section 1, LGPL section 1, BSD clause 2, MIT). They are in `licenses/` and attached as `licenses-<version>.tar.gz`.
 3. *State the terms.* Every release's notes carry a licensing paragraph; this README states it in full.
-4. *Record how it was built*, so the source really corresponds to the binary: the pinned util-linux version and tarball checksum, the Alpine release and musl version, and the configure flags, all listed below.
+4. *Record how it was built*, so the source really corresponds to the binary: the pinned util-linux version and tarball checksum, the Alpine release and musl version, and the configure flags, all listed below and recorded again in each release's notes.
 
 **If you redistribute a binary yourself**, for example by having your installer download it or by bundling it in your own release, the same obligations pass to you. The simplest way to meet them is to ship the util-linux tarball and `licenses-<version>.tar.gz` from the same release next to the binary, or to point at this release and keep the pinned checksum, which GPLv2 section 3 counts as offering equivalent access to the source from the same place. Running `sfdisk` as a separate process from your own program does not place your program under the GPL; GPLv2 calls that mere aggregation.
 
 ## How the binaries are built
 
-- **Source:** util-linux 2.42.4, released 2026-09-21, from [kernel.org](https://mirrors.edge.kernel.org/pub/linux/utils/util-linux/v2.42/). Tarball `util-linux-2.42.4.tar.xz`, SHA-256 `fbd62a100ab7bb8746ba0661255c3c48185b1e9021507c624da01fbc696330ec`, taken from the signed `sha256sums.asc` in that directory. The tarball is used unmodified.
-- **Toolchain:** Alpine Linux 3.22 (musl 1.2.5, gcc and binutils from Alpine's `build-base`), one container per architecture.
-- **Configure:**
+- **Source:** the util-linux version in [`VERSION`](VERSION), from [kernel.org](https://mirrors.edge.kernel.org/pub/linux/utils/util-linux/). The tarball's SHA-256 is pinned in [`util-linux.sha256`](util-linux.sha256), copied from the signed `sha256sums.asc` in the release directory, and the build stops if the download does not match it. The tarball is used unmodified.
+- **Toolchain:** Alpine Linux 3.24 (the `alpine:3.24` image: musl 1.2.6, gcc and binutils from Alpine's `build-base`, kernel headers from `linux-headers`), one container per architecture, each on a native GitHub-hosted runner: `ubuntu-26.04` for x86_64 and `ubuntu-26.04-arm` for aarch64. The compiling happens in Alpine because musl is Alpine's own C library. A static binary depends only on the kernel, so the host distribution does not change it. Each release's notes record the image digest and the exact package versions.
+- **Configure:** [`scripts/build.sh`](scripts/build.sh) runs:
 
   ```sh
   ./configure --disable-shared --enable-static --disable-nls --disable-bash-completion \
@@ -62,10 +62,34 @@ The GPL governs the combination, so each binary is distributed under **GPL-2.0-o
   strip -o sfdisk sfdisk.static
   ```
 
-  `--enable-static-programs` is util-linux's own supported way of producing a static binary. `--enable-fdisks=check` builds `sfdisk` and `fdisk` and skips `cfdisk`, which would need ncurses.
-- **Checks before release:** `file` reports `statically linked`; the binary runs `--version` from an empty chroot; no ncurses or libintl symbols are present.
+  `--enable-static-programs` is util-linux's own supported way of producing a static binary. `--enable-fdisks=check` builds `sfdisk` and `fdisk` and skips `cfdisk`, which would need ncurses. Alpine's gcc builds position-independent executables by default, so `-static` produces a static PIE: it needs no dynamic loader or shared library, like any static binary, and the kernel loads it at a random address.
+- **Checks before release:** `scripts/build.sh` stops if the unstripped binary contains ncurses or libintl symbols. [`scripts/check.sh`](scripts/check.sh) then runs on the Ubuntu 26.04 runner of each architecture: `file` must report `static-pie linked` or `statically linked`, the binary must run `--version` from an empty chroot and report the expected version, and it must write and read back a GPT on a disk image.
 
-Builds are deterministic in their inputs but not yet bit-for-bit reproducible, because the package versions inside the Alpine image move with the image. Pinning the image by digest is the next step if byte-identical rebuilds become a requirement.
+Builds are deterministic in their inputs but not yet bit-for-bit reproducible, because the Alpine image and the packages `apk` installs move with Alpine 3.24's updates. Pinning the image by digest and the packages by version is the next step if byte-identical rebuilds become a requirement.
+
+## Releasing
+
+[`.github/workflows/release.yml`](.github/workflows/release.yml) runs on every push to `main`. If the repository has no release for the tag `v<VERSION>` yet, the workflow builds both binaries, checks them, and publishes the release with the assets listed above. If the release exists, it does nothing.
+
+To release a new util-linux version, for example 2.42.5, update both pinned files, then commit and push to `main`:
+
+```sh
+echo 2.42.5 > VERSION
+curl -fsSLO https://mirrors.edge.kernel.org/pub/linux/utils/util-linux/v2.42/sha256sums.asc
+gpg --verify sha256sums.asc
+grep ' util-linux-2.42.5.tar.xz$' sha256sums.asc > util-linux.sha256
+```
+
+`gpg --verify` must report a good signature from the kernel.org checksum autosigner, key `B8868C80BA62A1FFFAF5FDA9632D3A06589DA6B1`, published in kernel.org's [pgpkeys](https://git.kernel.org/pub/scm/docs/kernel/pgpkeys.git) repository.
+
+To rebuild the same upstream version, for example after an Alpine update or a fix to the build, set `VERSION` to `2.42.5-2` and leave `util-linux.sha256` as it is.
+
+To build locally with Docker for the machine's own architecture, then check the result on a Linux host:
+
+```sh
+docker run --rm -v "$PWD:/work" -w /work alpine:3.24 scripts/build.sh
+scripts/check.sh dist/sfdisk-2.42.4-$(uname -m)-linux-musl 2.42.4
+```
 
 ## Upstream
 
